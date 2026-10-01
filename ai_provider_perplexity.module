@@ -21,11 +21,11 @@ function ai_provider_perplexity_ai_provider_info() {
   return [
     'perplexity' => [
       'label' => t('Perplexity AI'),
-      'description' => t('Perplexity live web-grounded inference and reasoning models with real-time citations.'),
+      'description' => t('Perplexity Agent API: frontier and open models with optional live web search and citations, plus embeddings and decisions.'),
       'class' => 'AIPerplexityAdapter',
       'website' => 'https://www.perplexity.ai/',
-      'key_url' => 'https://www.perplexity.ai/settings/api',
-      'models_url' => 'https://docs.perplexity.ai/guides/model-cards',
+      'key_url' => 'https://console.perplexity.ai/project/keys',
+      'models_url' => 'https://docs.perplexity.ai/docs/agent-api/models',
     ],
   ];
 }
@@ -40,4 +40,78 @@ function ai_provider_perplexity_config_info() {
       'group' => t('Configuration'),
     ],
   ];
+}
+
+/**
+ * Implements hook_ai_provider_settings_alter().
+ */
+function ai_provider_perplexity_ai_provider_settings_alter(&$settings, $context) {
+  if ($context['provider'] !== 'perplexity') {
+    return;
+  }
+
+  $config = config('ai_provider_perplexity.settings');
+
+  $settings['perplexity_web_search'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Web search'),
+    '#default_value' => $config->get('web_search') ?? TRUE,
+    '#description' => t('Give every request the built-in web search tool, so answers can cite live sources. Searches are billed per call. Callers can override this per request with <code>web_search</code> in the request context.'),
+    '#weight' => -4,
+  ];
+
+  $settings['perplexity_max_steps'] = [
+    '#type' => 'number',
+    '#title' => t('Maximum steps'),
+    '#default_value' => $config->get('max_steps') ?: 3,
+    '#min' => 2,
+    '#max' => 100,
+    '#description' => t('How many search-and-reason steps a request may take when web search is on (at least 2: one to search, one to answer).'),
+    '#weight' => -3,
+  ];
+
+  $settings['perplexity_embedding_models'] = [
+    '#type' => 'textarea',
+    '#title' => t('Embedding models'),
+    '#default_value' => $config->get('embedding_models') ?: '',
+    '#rows' => 2,
+    '#description' => t('One model ID per line. The embeddings endpoint has no model listing; see <a href="@url">Perplexity embeddings</a> for current IDs.', ['@url' => 'https://docs.perplexity.ai/docs/embeddings/quickstart']),
+    '#weight' => -2,
+  ];
+
+  $settings['perplexity_decision_models'] = [
+    '#type' => 'textarea',
+    '#title' => t('Decision models'),
+    '#default_value' => $config->get('decision_models') ?: '',
+    '#rows' => 2,
+    '#description' => t('One model ID per line, for the native Decisions API. The endpoint has no model listing; see <a href="@url">Perplexity decisions</a> for current IDs. Without one, decisions are emulated through chat.', ['@url' => 'https://docs.perplexity.ai/docs/decisions/quickstart']),
+    '#weight' => -1,
+  ];
+
+  $context['form']['#submit'][] = 'ai_provider_perplexity_settings_submit';
+}
+
+/**
+ * Submit handler for Perplexity provider settings.
+ */
+function ai_provider_perplexity_settings_submit($form, &$form_state) {
+  // The providers form uses #tree, so these values sit under the provider's
+  // settings container, not at the top level.
+  $values = $form_state['values']['providers']['perplexity_settings'] ?? [];
+  $config = config('ai_provider_perplexity.settings');
+
+  if (isset($values['perplexity_web_search'])) {
+    $config->set('web_search', (bool) $values['perplexity_web_search']);
+  }
+  if (isset($values['perplexity_max_steps'])) {
+    $config->set('max_steps', max(2, (int) $values['perplexity_max_steps']));
+  }
+  if (isset($values['perplexity_embedding_models'])) {
+    $config->set('embedding_models', trim($values['perplexity_embedding_models']));
+  }
+  if (isset($values['perplexity_decision_models'])) {
+    $config->set('decision_models', trim($values['perplexity_decision_models']));
+  }
+
+  $config->save();
 }

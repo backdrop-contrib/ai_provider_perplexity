@@ -2,12 +2,16 @@
 
 /**
  * @file
- * Perplexity AI adapter for AI core.
+ * Perplexity adapter for AI core, built on the Agent API.
+ *
+ * Sonar Chat Completions support ended on 2026-09-27. The Agent API
+ * (POST /v1/agent) takes an `input` array of typed items and returns an
+ * `output` array; it serves Perplexity's own and third-party models, with web
+ * search as an optional built-in tool and real function calling. Embeddings
+ * (/v1/embeddings) and decisions (/v1/decisions) are separate endpoints.
  */
 
 class AIPerplexityAdapter extends AIAdapterBase {
-
-  use AICompatibleTrait;
 
   /** @var string */
   protected $baseUrl = 'https://api.perplexity.ai';
@@ -16,14 +20,54 @@ class AIPerplexityAdapter extends AIAdapterBase {
   protected $models = NULL;
 
   /**
+   * Model IDs from /v1/models (Agent API models).
+   *
+   * @var array
+   */
+  protected $agentModels = [];
+
+  /** @var array */
+  protected $embeddingModels = [];
+
+  /** @var array */
+  protected $decisionModels = [];
+
+  /** @var bool */
+  protected $webSearch = TRUE;
+
+  /** @var int */
+  protected $maxSteps = 3;
+
+  /**
    * {@inheritdoc}
    */
   public function __construct($api_key, ?AIApi $api = NULL) {
     parent::__construct($api_key, $api);
-    $config_base = config_get('ai_provider_perplexity.settings', 'base_url');
-    if (!empty($config_base)) {
-      $this->baseUrl = rtrim($config_base, '/');
+    $config = config('ai_provider_perplexity.settings');
+    $base = trim((string) $config->get('base_url'));
+    if ($base !== '') {
+      $this->baseUrl = rtrim($base, '/');
     }
+    $this->webSearch = (bool) ($config->get('web_search') ?? TRUE);
+    $this->maxSteps = max(1, min(100, (int) ($config->get('max_steps') ?: 3)));
+    // Neither endpoint has a model listing, so these models come from
+    // settings.
+    $this->embeddingModels = $this->parseModelList($config->get('embedding_models'));
+    $this->decisionModels = $this->parseModelList($config->get('decision_models'));
+  }
+
+  /**
+   * Parse a one-model-per-line settings value.
+   */
+  protected function parseModelList($value): array {
+    $models = [];
+    foreach (preg_split('/[\r\n,]+/', (string) $value) as $line) {
+      $line = trim($line);
+      if ($line !== '' && $line[0] !== '#') {
+        $models[$line] = $line;
+      }
+    }
+    return $models;
   }
 
   /**
@@ -44,13 +88,21 @@ class AIPerplexityAdapter extends AIAdapterBase {
       return $this->models;
     }
 
-    $models = [
-      'sonar' => 'Perplexity Sonar (Online Search)',
-      'sonar-pro' => 'Perplexity Sonar Pro (Advanced Search)',
-      'sonar-reasoning' => 'Perplexity Sonar Reasoning (Search & CoT)',
-      'sonar-reasoning-pro' => 'Perplexity Sonar Reasoning Pro',
-    ];
+    $this->agentModels = [];
+    try {
+      $result = $this->makeRequest($this->baseUrl . '/v1/models', [], [], 'GET', 10);
+      foreach ($result['data'] ?? [] as $model) {
+        $id = $model['id'] ?? NULL;
+        if (!empty($id)) {
+          $this->agentModels[$id] = $id;
+        }
+      }
+    }
+    catch (\Exception $e) {
+      watchdog('ai_provider_perplexity', 'Failed to fetch Perplexity models: @message', ['@message' => $e->getMessage()], WATCHDOG_WARNING);
+    }
 
+    $models = $this->agentModels + $this->embeddingModels + $this->decisionModels;
     asort($models);
     return $this->models = $models;
   }
@@ -59,36 +111,29 @@ class AIPerplexityAdapter extends AIAdapterBase {
    * {@inheritdoc}
    */
   public function getModelsByCapability($capability): array {
-    $models = $this->getModels();
+    $this->getModels();
     $capability = ai_normalize_capability_name($capability);
-    $filtered = [];
 
-    foreach ($models as $id => $label) {
-      $ok = FALSE;
-      switch ($capability) {
-        case 'text':
-        case 'chat':
-          $ok = TRUE;
-          break;
+    switch ($capability) {
+      // /v1/models has no capability metadata; every Agent API model takes
+      // text and custom functions. Vision and thinking are assigned on the
+      // Model capabilities page.
+      case 'text':
+      case 'tool_calling':
+        $filtered = $this->agentModels;
+        break;
 
-        case 'thinking':
-          $ok = (bool) preg_match('/reasoning/i', $id);
-          break;
+      case 'embeddings':
+        $filtered = $this->embeddingModels;
+        break;
 
-        case 'tool_calling':
-        case 'vision':
-        case 'embeddings':
-        case 'embedding':
-        case 'image':
-        case 'moderation':
-        case 'stt':
-          $ok = FALSE;
-          break;
-      }
+      case 'decision':
+        $filtered = $this->decisionModels;
+        break;
 
-      if ($ok) {
-        $filtered[$id] = $label;
-      }
+      default:
+        $filtered = [];
+        break;
     }
 
     backdrop_alter('ai_model_capabilities', $filtered, $capability, $this);
@@ -96,37 +141,114 @@ class AIPerplexityAdapter extends AIAdapterBase {
   }
 
   /**
-   * {@inheritdoc}
+   * Convert chat-completions messages into Agent API input items.
    */
-  public function completions(string $model, string $prompt, $temperature, $max_tokens = 512, bool $stream_response = FALSE) {
-    $messages = [
-      ['role' => 'user', 'content' => $prompt],
-    ];
-    return $this->chat($model, $messages, $temperature, $max_tokens, $stream_response);
+  protected function buildInput(array $messages): array {
+    $input = [];
+    foreach ($messages as $message) {
+      $role = $message['role'] ?? 'user';
+
+      if ($role === 'tool') {
+        $content = $message['content'] ?? '';
+        $input[] = [
+          'type' => 'function_call_output',
+          'call_id' => (string) ($message['tool_call_id'] ?? ''),
+          'output' => is_string($content) ? $content : json_encode($content),
+        ];
+        continue;
+      }
+
+      $content = $this->convertContent($message['content'] ?? '', $role);
+      if ($content !== '' && $content !== []) {
+        $input[] = [
+          'type' => 'message',
+          'role' => in_array($role, ['user', 'assistant', 'system', 'developer'], TRUE) ? $role : 'user',
+          'content' => $content,
+        ];
+      }
+
+      if ($role === 'assistant') {
+        foreach ($message['tool_calls'] ?? [] as $call) {
+          $arguments = $call['function']['arguments'] ?? ($call['arguments'] ?? '{}');
+          $item = [
+            'type' => 'function_call',
+            'call_id' => (string) ($call['id'] ?? ''),
+            'name' => (string) ($call['function']['name'] ?? ($call['name'] ?? '')),
+            'arguments' => is_string($arguments) ? $arguments : json_encode($arguments),
+          ];
+          // Thinking models reject a replayed call without its signature.
+          if (!empty($call['thought_signature'])) {
+            $item['thought_signature'] = $call['thought_signature'];
+          }
+          $input[] = $item;
+        }
+      }
+    }
+    return $input;
   }
 
   /**
-   * {@inheritdoc}
+   * Convert chat-completions message content into Agent API content.
+   *
+   * @return string|array
+   *   A string, or input_text/input_image parts for multimodal user content.
    */
-  public function chat(string $model, array $messages, $temperature, $max_tokens = 1024, bool $stream_response = FALSE, array $context_extra = []) {
-    $url = $this->baseUrl . '/chat/completions';
+  protected function convertContent($content, string $role) {
+    if (!is_array($content)) {
+      return (string) $content;
+    }
 
+    $parts = [];
+    $text = '';
+    foreach ($content as $part) {
+      $type = $part['type'] ?? '';
+      if ($type === 'text' || $type === 'input_text') {
+        $parts[] = ['type' => 'input_text', 'text' => (string) ($part['text'] ?? '')];
+        $text .= ($text === '' ? '' : "\n") . ($part['text'] ?? '');
+      }
+      elseif ($type === 'image_url' || $type === 'input_image') {
+        $url = $part['image_url']['url'] ?? ($part['image_url'] ?? '');
+        if (is_string($url) && $url !== '') {
+          $parts[] = ['type' => 'input_image', 'image_url' => $url];
+        }
+      }
+    }
+    // Only user messages take image parts; flatten the rest to text.
+    return $role === 'user' ? $parts : $text;
+  }
+
+  /**
+   * Build the shared Agent API payload.
+   */
+  protected function buildPayload(string $model, array $messages, $temperature, $max_tokens, array $context_extra, array $function_tools = []): array {
     $payload = [
       'model' => $model,
-      'messages' => $messages,
+      'input' => $this->buildInput($messages),
+      // Required by anthropic/* models; the API returns 400 without it.
+      'max_output_tokens' => (int) $max_tokens > 0 ? (int) $max_tokens : 4096,
       'temperature' => (float) $temperature,
-      'return_citations' => TRUE,
     ];
 
-    if ((int) $max_tokens > 0) {
-      $payload['max_tokens'] = (int) $max_tokens;
+    $tools = $function_tools;
+    $web_search = $context_extra['web_search'] ?? $this->webSearch;
+    if ($web_search) {
+      $search = ['type' => 'web_search'];
+      if (!empty($context_extra['search_domain_filter'])) {
+        $search['filters']['search_domain_filter'] = array_values((array) $context_extra['search_domain_filter']);
+      }
+      $tools[] = $search;
+    }
+    if ($tools) {
+      $payload['tools'] = $tools;
     }
 
-    if (!empty($context_extra['search_domain_filter'])) {
-      $payload['search_domain_filter'] = (array) $context_extra['search_domain_filter'];
+    // Without a preset max_steps defaults to 1, which leaves no step to answer
+    // after a search.
+    if ($web_search) {
+      $payload['max_steps'] = max(2, $this->maxSteps);
     }
 
-    if (!empty($context_extra['response_format'])) {
+    if (!empty($context_extra['response_format']['type']) && $context_extra['response_format']['type'] === 'json_schema') {
       $payload['response_format'] = $context_extra['response_format'];
     }
     elseif (!empty($context_extra['json_schema'])) {
@@ -139,35 +261,131 @@ class AIPerplexityAdapter extends AIAdapterBase {
         ],
       ];
     }
-    elseif (!empty($context_extra['json_mode'])) {
-      $payload['response_format'] = ['type' => 'json_object'];
+    elseif (!empty($context_extra['json_mode']) || (($context_extra['response_format']['type'] ?? '') === 'json_object')) {
+      // The Agent API has only json_schema; an open object schema is the
+      // equivalent of JSON mode.
+      $payload['response_format'] = [
+        'type' => 'json_schema',
+        'json_schema' => ['name' => 'response', 'schema' => ['type' => 'object']],
+      ];
     }
+
+    return $payload;
+  }
+
+  /**
+   * POST to /v1/agent and check the run status.
+   *
+   * Some models reject a non-default temperature; that 400 is retried once
+   * without it rather than guessing which models those are.
+   */
+  protected function runAgent(array $payload): array {
+    $url = $this->baseUrl . '/v1/agent';
+    try {
+      $result = $this->makeRequest($url, $payload, [], 'POST', 300);
+    }
+    catch (\Exception $e) {
+      if (strpos($e->getMessage(), 'API error (400)') !== 0 || strpos($e->getMessage(), 'temperature') === FALSE) {
+        throw $e;
+      }
+      unset($payload['temperature']);
+      $result = $this->makeRequest($url, $payload, [], 'POST', 300);
+    }
+
+    $status = $result['status'] ?? 'completed';
+    if ($status === 'failed' || $status === 'cancelled') {
+      throw new \RuntimeException('Perplexity run ' . $status . ': ' . ($result['error']['message'] ?? 'no error message'));
+    }
+    return $result;
+  }
+
+  /**
+   * Collect the answer text, citations and function calls from a run.
+   */
+  protected function parseOutput(array $result): array {
+    $text = '';
+    $citations = [];
+    $tool_calls = [];
+
+    foreach ($result['output'] ?? [] as $item) {
+      $type = $item['type'] ?? '';
+      if ($type === 'message') {
+        foreach ($item['content'] ?? [] as $part) {
+          if (($part['type'] ?? '') === 'output_text') {
+            $text .= $part['text'] ?? '';
+            foreach ($part['annotations'] ?? [] as $annotation) {
+              if (!empty($annotation['url'])) {
+                $citations[$annotation['url']] = $annotation['title'] ?? $annotation['url'];
+              }
+            }
+          }
+        }
+      }
+      elseif ($type === 'function_call') {
+        $arguments = json_decode((string) ($item['arguments'] ?? ''), TRUE);
+        $call = [
+          'id' => (string) ($item['call_id'] ?? ''),
+          'name' => (string) ($item['name'] ?? ''),
+          'arguments' => is_array($arguments) ? $arguments : [],
+        ];
+        if (!empty($item['thought_signature'])) {
+          $call['thought_signature'] = $item['thought_signature'];
+        }
+        $tool_calls[] = $call;
+      }
+    }
+
+    if ($tool_calls) {
+      $finish_reason = 'tool_calls';
+    }
+    else {
+      $finish_reason = ($result['status'] ?? '') === 'incomplete' ? 'length' : 'stop';
+    }
+
+    return [
+      'content' => trim($text),
+      'citations' => $citations,
+      'tool_calls' => $tool_calls,
+      'finish_reason' => $finish_reason,
+    ];
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function completions(string $model, string $prompt, $temperature, $max_tokens = 512, bool $stream_response = FALSE) {
+    return $this->chat($model, [['role' => 'user', 'content' => $prompt]], $temperature, $max_tokens, $stream_response);
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function chat(string $model, array $messages, $temperature, $max_tokens = 1024, bool $stream_response = FALSE, array $context_extra = []) {
+    $payload = $this->buildPayload($model, $messages, $temperature, $max_tokens, $context_extra);
 
     try {
       if ($stream_response) {
         $payload['stream'] = TRUE;
-        return $this->buildStreamingResponse($url, [
+        return $this->buildStreamingResponse($this->baseUrl . '/v1/agent', [
           'method' => 'POST',
           'headers' => array_merge(['Accept' => 'text/event-stream'], $this->getDefaultHeaders()),
           'data' => json_encode($payload),
           'timeout' => 300,
         ], function ($data) {
-          return $data['choices'][0]['delta']['content'] ?? '';
+          // Only answer text; search and reasoning events carry no text.
+          return ($data['type'] ?? '') === 'response.output_text.delta' ? (string) ($data['delta'] ?? '') : '';
         });
       }
 
-      $result = $this->makeRequest($url, $payload, [], 'POST', 300);
-      $content = trim($result['choices'][0]['message']['content'] ?? '');
-
-      // Append citations if available and requested in context.
-      if (!empty($context_extra['append_citations']) && !empty($result['citations'])) {
-        $citations_text = "\n\n### Sources:\n";
-        foreach ($result['citations'] as $idx => $citation_url) {
-          $citations_text .= "[" . ($idx + 1) . "] " . $citation_url . "\n";
+      $parsed = $this->parseOutput($this->runAgent($payload));
+      $content = $parsed['content'];
+      if (!empty($context_extra['append_citations']) && $parsed['citations']) {
+        $content .= "\n\n### Sources:\n";
+        $i = 1;
+        foreach (array_keys($parsed['citations']) as $url) {
+          $content .= '[' . $i++ . '] ' . $url . "\n";
         }
-        $content .= $citations_text;
       }
-
       return $content;
     }
     catch (\Exception $e) {
@@ -180,48 +398,104 @@ class AIPerplexityAdapter extends AIAdapterBase {
    * {@inheritdoc}
    */
   public function chatWithTools(string $model, array $messages, array $tools, $temperature, $max_tokens = 1024, string $tool_choice = 'auto', array $context_extra = []): array {
-    // Perplexity does not support custom function calling. Emulate via standard chat.
-    $prompt = "You are an assistant that must call a function. Available tools:\n" . json_encode($tools) . "\n\nPlease respond with a JSON object format: {\"name\": \"function_name\", \"arguments\": {...}}";
-    $augmented_messages = array_merge([['role' => 'system', 'content' => $prompt]], $messages);
-    $response = $this->chat($model, $augmented_messages, $temperature, $max_tokens, FALSE, $context_extra);
-
-    // Models often wrap JSON in a markdown fence; strip it before decoding.
-    $json = preg_replace('/^\s*```(?:json)?\s*|\s*```\s*$/i', '', $response);
-    $parsed = json_decode($json, TRUE);
-    if (is_array($parsed) && !empty($parsed['name'])) {
-      $args = $parsed['arguments'] ?? [];
-      if (is_string($args)) {
-        $args = json_decode($args, TRUE) ?? [];
+    // Agent API function tools are flat: {type, name, description,
+    // parameters}. It has no tool_choice parameter, so 'required' and named
+    // choices can't be forced.
+    $function_tools = [];
+    foreach ($tools as $tool) {
+      $function = $tool['function'] ?? $tool;
+      if (empty($function['name'])) {
+        continue;
       }
-      // Same shape as AICompatibleTrait::normalizeToolResponse().
-      return [
-        'finish_reason' => 'tool_calls',
-        'content' => '',
-        'tool_calls' => [
-          [
-            'id' => 'call_' . uniqid(),
-            'name' => $parsed['name'],
-            'arguments' => is_array($args) ? $args : [],
-          ],
-        ],
-        'raw' => $response,
-      ];
+      $function_tools[] = array_filter([
+        'type' => 'function',
+        'name' => $function['name'],
+        'description' => $function['description'] ?? NULL,
+        'parameters' => $function['parameters'] ?? NULL,
+      ], function ($value) {
+        return $value !== NULL;
+      });
+    }
+    if ($tool_choice === 'none') {
+      $function_tools = [];
     }
 
-    return [
-      'finish_reason' => 'stop',
-      'content' => $response,
-      'tool_calls' => [],
-      'raw' => $response,
-    ];
+    $payload = $this->buildPayload($model, $messages, $temperature, $max_tokens, $context_extra, $function_tools);
+
+    try {
+      $result = $this->runAgent($payload);
+      $parsed = $this->parseOutput($result);
+      return [
+        'finish_reason' => $parsed['finish_reason'],
+        'content' => $parsed['content'],
+        'tool_calls' => $parsed['tool_calls'],
+        'raw' => $result,
+      ];
+    }
+    catch (\Exception $e) {
+      watchdog('ai_provider_perplexity', 'Perplexity chatWithTools error: @message', ['@message' => $e->getMessage()], WATCHDOG_ERROR);
+      throw $e;
+    }
   }
 
   /**
    * {@inheritdoc}
    */
   public function embedding(string $input, string $model, bool $log = TRUE): array {
-    watchdog('ai_provider_perplexity', 'Embeddings are not supported by Perplexity.', [], WATCHDOG_WARNING);
-    throw new \RuntimeException('Embeddings are not supported by Perplexity.');
+    try {
+      $result = $this->makeRequest($this->baseUrl . '/v1/embeddings', [
+        'model' => $model,
+        'input' => $input,
+      ], [], 'POST', 60);
+    }
+    catch (\Exception $e) {
+      watchdog('ai_provider_perplexity', 'Perplexity embedding error: @message', ['@message' => $e->getMessage()], WATCHDOG_ERROR);
+      throw $e;
+    }
+
+    // Vectors arrive base64-encoded as signed int8 (the default encoding).
+    $encoded = $result['data'][0]['embedding'] ?? NULL;
+    if (is_array($encoded)) {
+      return array_map('floatval', $encoded);
+    }
+    $bytes = is_string($encoded) ? base64_decode($encoded, TRUE) : FALSE;
+    if ($bytes === FALSE || $bytes === '') {
+      throw new \RuntimeException('Perplexity returned no embedding vector for ' . $model . '.');
+    }
+    return array_map('floatval', array_values(unpack('c*', $bytes)));
+  }
+
+  /**
+   * {@inheritdoc}
+   */
+  public function decide(string $input, array $questions, string $model = '', array $context_extra = []): array {
+    if (empty($questions)) {
+      return [];
+    }
+    if ($model === '') {
+      $model = (string) array_key_first($this->decisionModels);
+    }
+    // A chat model (or no decision model configured) uses the emulation.
+    if ($model === '' || !isset($this->decisionModels[$model])) {
+      return parent::decide($input, $questions, $model, $context_extra);
+    }
+
+    [$question_map, $meta] = AIDecisionHelper::buildQuestions($questions);
+    try {
+      $response = $this->makeRequest($this->baseUrl . '/v1/decisions', [
+        'model' => $model,
+        'state' => $input,
+        'questions' => $question_map,
+      ], [], 'POST', 60);
+      return AIDecisionHelper::parseAnswers($response, $meta);
+    }
+    catch (\Exception $e) {
+      watchdog('ai_provider_perplexity', 'Perplexity decision request failed for model @model: @message', [
+        '@model' => $model,
+        '@message' => $e->getMessage(),
+      ], WATCHDOG_ERROR);
+      throw $e;
+    }
   }
 
   /**
