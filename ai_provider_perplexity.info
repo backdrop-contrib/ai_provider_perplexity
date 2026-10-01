@@ -1,5 +1,5 @@
 name = AI Provider Perplexity
-description = Perplexity AI provider offering live search-grounded chat and reasoning models.
+description = Perplexity Agent API provider: chat with optional live web search, function calling, embeddings and decisions.
 backdrop = 1.x
 type = module
 php = 8.0

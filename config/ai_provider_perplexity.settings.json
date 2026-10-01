@@ -1,4 +1,8 @@
 {
   "_config_name": "ai_provider_perplexity.settings",
-  "base_url": "https://api.perplexity.ai"
+  "base_url": "https://api.perplexity.ai",
+  "web_search": true,
+  "max_steps": 3,
+  "embedding_models": "",
+  "decision_models": ""
 }
