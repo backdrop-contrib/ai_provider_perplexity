@@ -1,0 +1,8 @@
+name = AI Provider Perplexity
+description = Perplexity AI provider offering live search-grounded chat and reasoning models.
+backdrop = 1.x
+type = module
+php = 8.0
+package = AI
+dependencies[] = ai
+dependencies[] = key

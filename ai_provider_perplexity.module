@@ -1,0 +1,43 @@
+<?php
+
+/**
+ * @file
+ * Perplexity AI provider for AI core.
+ */
+
+/**
+ * Implements hook_autoload_info().
+ */
+function ai_provider_perplexity_autoload_info() {
+  return [
+    'AIPerplexityAdapter' => 'includes/AIPerplexityAdapter.php',
+  ];
+}
+
+/**
+ * Implements hook_ai_provider_info().
+ */
+function ai_provider_perplexity_ai_provider_info() {
+  return [
+    'perplexity' => [
+      'label' => t('Perplexity AI'),
+      'description' => t('Perplexity live web-grounded inference and reasoning models with real-time citations.'),
+      'class' => 'AIPerplexityAdapter',
+      'website' => 'https://www.perplexity.ai/',
+      'key_url' => 'https://www.perplexity.ai/settings/api',
+      'models_url' => 'https://docs.perplexity.ai/guides/model-cards',
+    ],
+  ];
+}
+
+/**
+ * Implements hook_config_info().
+ */
+function ai_provider_perplexity_config_info() {
+  return [
+    'ai_provider_perplexity.settings' => [
+      'label' => t('Perplexity Settings'),
+      'group' => t('Configuration'),
+    ],
+  ];
+}
